@@ -1,0 +1,73 @@
+name: ClimateData CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mysql-client python3 python3-pip docker.io
+          pip3 install mysql-connector-python
+
+      # Start MySQL via Docker directly instead of using services
+      - name: Start MySQL container
+        env:
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        run: |
+          docker run -d --name mysql \
+            -e MYSQL_ROOT_PASSWORD=$DB_PASSWORD \
+            -e MYSQL_DATABASE=project_db \
+            -p 3306:3306 \
+            mysql:8.0
+          # wait for MySQL to accept connections
+          for i in {1..10}; do
+            mysql -h 127.0.0.1 -u root -p$DB_PASSWORD -e "SELECT 1;" && break
+            sleep 3
+          done
+
+      - name: Run schema changes
+        env:
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        run: mysql -h 127.0.0.1 -u root -p$DB_PASSWORD < schema_changes.sql
+
+      - name: Pull Flyway
+        run: docker pull redgate/flyway
+
+      - name: Apply migrations
+        env:
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        run: |
+          docker run --rm \
+            --network host \
+            -v "${{ github.workspace }}/migrations:/flyway/sql" \
+            redgate/flyway \
+            -user=root \
+            -password=$DB_PASSWORD \
+            -url="jdbc:mysql://127.0.0.1:3306/project_db?allowPublicKeyRetrieval=true&useSSL=false" \
+            migrate
+
+      - name: Run concurrent queries
+        env:
+          DB_HOST: 127.0.0.1
+          DB_USER: root
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          DB_NAME: project_db
+        run: python3 scripts/multi_thread_queries.py
+
+      - name: Validate schema and data
+        env:
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        run: |
+          echo "Table definition:"
+          mysql -h 127.0.0.1 -u root -p$DB_PASSWORD -e "DESCRIBE project_db.ClimateData;"
+          echo "Row count:"
+          mysql -h 127.0.0.1 -u root -p$DB_PASSWORD -e "SELECT COUNT(*) FROM project_db.ClimateData;"
